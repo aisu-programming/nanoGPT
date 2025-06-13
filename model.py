@@ -328,3 +328,112 @@ class GPT(nn.Module):
             idx = torch.cat((idx, idx_next), dim=1)
 
         return idx
+
+
+
+@dataclass
+class Config:
+    n_embd: int
+    n_head: int
+    block_size: int
+    bias: bool = False
+    dropout: float = 0.0
+
+class T64TransformerBlock(nn.Module):
+    def __init__(self, embd_dim, n_heads, block_size, dropout):
+        super().__init__()
+        self.ln1 = nn.LayerNorm(embd_dim)
+        self.attn = CausalSelfAttention(Config(
+            n_embd=embd_dim,
+            n_head=n_heads,
+            block_size=block_size))
+        self.ln2 = nn.LayerNorm(embd_dim)
+        self.ffn = nn.Sequential(
+            nn.Linear(embd_dim, 4 * embd_dim),
+            nn.ReLU(),
+            nn.Linear(4 * embd_dim, embd_dim)
+        )
+        self.dropout = nn.Dropout(dropout)
+
+    def forward(self, x):
+        x = x + self.dropout(self.attn(self.ln1(x)))
+        x = x + self.dropout(self.ffn(self.ln2(x)))
+        return x
+
+class T64(nn.Module):
+    def __init__(self, vocab_size=256, embd_dim=512, n_layer=64, block_size=512,
+                 n_head=2, dropout=0.55, n_targets=2, max_steps=4_000_000):
+        super().__init__()
+
+        # L = n_layer
+        # B = batch_size
+        # T = block_size
+        # D = embd_dim
+        # K = n_targets
+        # V = vocab_size
+
+        self.vocab_size = vocab_size
+        self.n_layer = n_layer
+        self.block_size = block_size
+        self.n_targets = n_targets
+        self.max_steps = max_steps
+
+        self.token_emb = nn.Embedding(vocab_size, embd_dim)
+        self.pos_emb = nn.Parameter(torch.randn(n_layer, block_size, embd_dim))    # (L, T, D)
+        self.blocks = nn.ModuleList([
+            T64TransformerBlock(embd_dim, n_head, block_size, dropout)
+            for _ in range(n_layer)])
+        
+        self.lm_weight = nn.Parameter(torch.empty(n_layer, n_targets, embd_dim, vocab_size))    # (L, K, D, V)
+        self.lm_bias = nn.Parameter(torch.zeros(1, n_layer, n_targets, vocab_size))             # (1, L, K, V)
+        nn.init.normal_(self.lm_weight, mean=0.0, std=0.02)
+        
+        self.register_buffer("loss_thresholds", torch.arange(1, n_layer + 1) * (max_steps / (2 * n_layer)))    # (L,)
+        self.register_buffer("loss_last_layer_mask", torch.arange(n_layer) == (n_layer - 1))                   # (L,)
+        
+        # 權重：k=1 → 1.0，k>1 → 0.5
+        weights = [ 1.0 if k == 0 else 0.5 for k in range(n_targets) ]
+        self.register_buffer("weights", torch.tensor(weights).view(1, 1, 1, -1))    # shape (1, 1, 1, K)
+
+    def forward(self, idx, targets, step=None):
+        B, T = idx.shape
+        x = self.token_emb(idx)    # (B, T, D)
+
+        if step is not None:
+            assert targets.shape[-1] == self.n_targets
+
+            hidden_states = []    # (L, (B, T, D))
+            for l, block in enumerate(self.blocks):
+                x = block(x + self.pos_emb[l])    # (B, T, D)
+                hidden_states.append(x)
+            h_stack = torch.stack(hidden_states, dim=1)    # (B, L, T, D)
+
+            bias = self.lm_bias.unsqueeze(2)    # (1, L, 1, K, V)
+            logits = torch.einsum('bltd,lkdv->bltkv', h_stack, self.lm_weight) + bias    # (B, L, T, K, V)
+            targets = targets.unsqueeze(1).expand(-1, self.n_layer, -1, -1)              # (B, L, T, K)
+
+            l_mask = (step < self.loss_thresholds) | self.loss_last_layer_mask    # (L,)
+            logits  = logits  * l_mask.view(1, -1, 1, 1, 1)        # (B, L, T, K, V) × (1, L, 1, 1, 1)
+            targets = targets * l_mask.view(1, -1, 1, 1).long()    # (B, L, T, K)    × (1, L, 1, 1)
+            
+            logits_flat = logits.reshape(-1, logits.size(-1))    # (B×L×T×K, V)
+            targets_flat = targets.reshape(-1)                   # (B×L×T×K,)
+            
+            # 將 logits 與 targets reshape 成交叉熵接受的形式
+            loss_raw = F.cross_entropy(logits_flat, targets_flat, reduction="none")    # (B×L×T×K)
+            loss_raw = loss_raw.view(B, self.n_layer, T, self.n_targets)               # (B, L, T, K)
+            loss = (loss_raw * self.weights).mean()
+
+        else:
+            for l, block in enumerate(self.blocks):
+                x = block(x + self.pos_emb[l])
+            w = self.lm_weight[-1, 0]                         # (D, V)
+            b = self.lm_bias[:, -1, 0].unsqueeze(1)           # (1, 1, V)
+            logits = torch.einsum("btd,dv->btv", x, w) + b    # (B, T, V)
+            
+            logits_flat = logits.reshape(-1, logits.size(-1))    # (B×T, V)
+            targets_flat = targets.reshape(-1)                   # (B×T,)
+            
+            loss = F.cross_entropy(logits_flat, targets_flat)
+
+        return loss
